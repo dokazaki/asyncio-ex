@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 import asyncio
 import logging
+import time
 from typing import List
+from random import random
 
 
 class ServiceCall:
@@ -70,8 +72,17 @@ class MyServer:
             self.in_queue.task_done()
 
     async def alert_generator(self):
-        # Todo: add alert generator that sends messages to all TCP clients
-        pass
+        """ Send alerts at random intervals """
+        print('Alert generator started to send messages to all clients')
+        while True:
+            await asyncio.sleep(random() * 5.0)
+            msg_body = 'Alert: {}'.format(time.time())
+            msg = '{:02d}{}'.format(len(msg_body.encode()), msg_body)
+            payload = msg.encode()
+            print('Sending alert: {}'.format(msg))
+            for client in self.clients:
+                client.write(payload)
+                await client.drain()
 
     async def start(self):
         print('Starting TCP server')
@@ -103,7 +114,8 @@ if __name__ == "__main__":
     loop.run_until_complete(server.start())
     task_list = [
         asyncio.ensure_future(server.stop(60.0)),
-        asyncio.ensure_future(server.responder())
-        ]
+        asyncio.ensure_future(server.responder()),
+        asyncio.ensure_future(server.alert_generator())
+    ]
     loop.run_until_complete(server.kill(task_list))
     loop.close()
