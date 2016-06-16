@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import time
-from typing import List
 from random import random
 
 
@@ -31,58 +30,72 @@ class MyServer:
         self.ip = ip
         self.port = port
         self.server = None
-        self.in_queue = asyncio.Queue()
-        self.sigstop_queue = asyncio.Queue(maxsize=1)  # Windows doesn't do signals, so use a queue
+        self.stop_event = asyncio.Event()  # Windows doesn't do signals, so use a queue
         self.clients = []
+        self.tasks = set()
 
     async def handle_client(self, reader, writer):
+        task = asyncio.ensure_future(self.process_client(reader, writer))
+        self.tasks.add(task)
+
+    async def process_client(self, reader, writer):
         """ Handle socket I/O for one TCP client - persist until client closes connection or until server shutdown """
         print('Client handler started for socket {}'.format(writer.get_extra_info('peername')))
         self.clients.append(writer)
-        while True and writer.get_extra_info('peername') is not None:
+        while True:
             try:
-                hdr = await reader.read(2)
+                hdr = await reader.readexactly(2)
                 data_len = int(hdr.decode())
                 body = await reader.read(data_len)
-            except ConnectionResetError as e:
-                self.log.info("Socket closed: {}".format(e))
-                return
-            except ValueError as e:
-                self.log.info("Client sent EOF: {}".format(e))
-                return
+            except EOFError:
+                self.log.debug("reader %s gone", reader)
+                break
+            except Exception:
+                self.log.exception("problem with %s", reader)
+                break
 
             print('Got request: {}'.format(body))
-            q_data = ServiceCall(writer, body)
-            await self.in_queue.put(q_data)
-        writer.close()
 
-    async def responder(self):
-        """ Sit on input Q, and copy Q items to originating socket after a slight delay """
-        print('Responder started for handling queued items')
-        while True:
-            item = await self.in_queue.get()
+            item = ServiceCall(writer, body)
             print('Client request received')
             await asyncio.sleep(0.5)
-            if item.writer.get_extra_info('peername') is not None:
-                print('Client echo response being sent')
+            print('Client echo response being sent')
+            try:
                 item.writer.write(item.payload)
                 await item.writer.drain()
-            else:
-                self.log.info("Client socket closed before response could be sent")
-            self.in_queue.task_done()
+            except ConnectionResetError:
+                self.log.debug("writer %s gone", writer)
+                break
+            except Exception:
+                self.log.exception("problem with %s", writer)
+                break
+        writer.close()
 
     async def alert_generator(self):
         """ Send alerts at random intervals """
         print('Alert generator started to send messages to all clients')
-        while True:
+        while self.stop_event.is_set():
             await asyncio.sleep(random() * 5.0)
             msg_body = 'Alert: {}'.format(time.time())
             msg = '{:02d}{}'.format(len(msg_body.encode()), msg_body)
             payload = msg.encode()
             print('Sending alert: {}'.format(msg))
+            failed_clients = set()
             for client in self.clients:
-                client.write(payload)
-                await client.drain()
+                try:
+                    client.write(payload)
+                except Exception:
+                    self.log.exception("problem writing alert")
+                    failed_clients.add(client)
+            for client in self.clients:
+                try:
+                    await client.drain()
+                except Exception:
+                    self.log.exception("problem waiting for client to drain")
+                    failed_clients.add(client)
+            if len(failed_clients):
+                self.log.info("dropping %d client(s)", len(failed_clients))
+                self.clients = [c for c in self.clients if c not in failed_clients]
 
     async def start(self):
         print('Starting TCP server')
@@ -93,17 +106,19 @@ class MyServer:
         """ Initiates server shutdown by writing to the sigstop queue """
         print('Will stop server after {} seconds runtime'.format(wait_time))
         await asyncio.sleep(wait_time)
-        await self.sigstop_queue.put('1')
+        self.stop_event.set()
 
-    async def kill(self, tasks: List[asyncio.Task]):
-        """ Shutdown the server when anything is received in the sigstop queue """
+    async def kill(self):
+        """ Shutdown the server when the stop_event is set """
         print('Waiting to receive signal to stop server')
-        await self.sigstop_queue.get()
+        await self.stop_event.wait()
         print('Received signal to stop the server')
-        for task in tasks:
-            task.cancel()
-        self.sigstop_queue.task_done()
         self.server.close()
+        for client in self.clients:
+            client.close()
+        for task in self.tasks:
+            t = await task
+            self.log.info("task %s returned %s", task, t)
 
 
 if __name__ == "__main__":
@@ -112,10 +127,11 @@ if __name__ == "__main__":
     loop.set_debug(True)
     server = MyServer()
     loop.run_until_complete(server.start())
-    task_list = [
-        asyncio.ensure_future(server.stop(60.0)),
-        asyncio.ensure_future(server.responder()),
-        asyncio.ensure_future(server.alert_generator())
-    ]
-    loop.run_until_complete(server.kill(task_list))
+    for t in [
+            server.stop(6.0),
+            server.alert_generator()
+    ]:
+        task = asyncio.ensure_future(t)
+        server.tasks.add(task)
+    loop.run_until_complete(server.kill())
     loop.close()
